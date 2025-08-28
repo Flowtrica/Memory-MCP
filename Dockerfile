@@ -6,13 +6,12 @@ WORKDIR /app
 RUN npm init -y && \
     npm install express cors @modelcontextprotocol/server-memory @modelcontextprotocol/sdk
 
-# Create the proper MCP server
+# Create the proper MCP server with correct initialization
 RUN cat > server.js << 'EOF'
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const { spawn } = require('child_process');
-const { EventEmitter } = require('events');
 
 const app = express();
 const PORT = process.env.PORT || 8081;
@@ -57,7 +56,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// SSE endpoint with full MCP protocol
+// SSE endpoint with proper MCP protocol handling
 app.get('/sse', (req, res) => {
   console.log('New MCP connection from:', req.ip);
   
@@ -69,7 +68,7 @@ app.get('/sse', (req, res) => {
     'Access-Control-Allow-Headers': 'Cache-Control',
   });
 
-  // Start the actual MCP memory server process
+  // Start the MCP memory server process
   const mcpServer = spawn('npx', ['@modelcontextprotocol/server-memory'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { 
@@ -78,42 +77,69 @@ app.get('/sse', (req, res) => {
     }
   });
 
+  let isInitialized = false;
   let messageId = 0;
 
-  // Handle MCP server output
+  // Handle MCP server stdout (JSON-RPC messages)
   mcpServer.stdout.on('data', (data) => {
-    const output = data.toString();
+    const output = data.toString().trim();
     console.log('MCP Server output:', output);
     
-    // Forward JSON-RPC messages to SSE client
     const lines = output.split('\n').filter(line => line.trim());
     lines.forEach(line => {
       try {
-        const parsed = JSON.parse(line);
-        res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+        const message = JSON.parse(line);
+        res.write(`data: ${JSON.stringify(message)}\n\n`);
+        
+        // After initialization, request tools list
+        if (message.result && message.result.capabilities && !isInitialized) {
+          isInitialized = true;
+          console.log('MCP server initialized, requesting tools...');
+          
+          // Send tools/list request
+          const toolsRequest = {
+            jsonrpc: '2.0',
+            id: ++messageId,
+            method: 'tools/list',
+            params: {}
+          };
+          
+          setTimeout(() => {
+            mcpServer.stdin.write(JSON.stringify(toolsRequest) + '\n');
+          }, 500);
+        }
       } catch (e) {
-        // Not JSON, might be logs
-        console.log('MCP Server log:', line);
+        // Not JSON, might be logs - ignore
       }
     });
   });
 
+  // Handle MCP server stderr (logs)
   mcpServer.stderr.on('data', (data) => {
-    console.error('MCP Server Error:', data.toString());
+    const output = data.toString().trim();
+    console.log('MCP Server log:', output);
   });
 
   mcpServer.on('error', (error) => {
     console.error('Failed to start MCP server:', error);
-    res.write(`data: ${JSON.stringify({error: 'Failed to start MCP server', details: error.message})}\n\n`);
+    const errorMsg = {
+      jsonrpc: '2.0',
+      error: {
+        code: -32000,
+        message: 'Failed to start MCP server',
+        data: error.message
+      }
+    };
+    res.write(`data: ${JSON.stringify(errorMsg)}\n\n`);
   });
 
-  // Send initialize message to MCP server
+  // Initialize the MCP connection
   const initializeMessage = {
     jsonrpc: '2.0',
     id: ++messageId,
     method: 'initialize',
     params: {
-      protocolVersion: '2025-06-18',
+      protocolVersion: '2024-11-05',
       capabilities: {},
       clientInfo: {
         name: 'mcp-memory-remote',
@@ -122,43 +148,37 @@ app.get('/sse', (req, res) => {
     }
   };
 
+  // Send initialize after a short delay
   setTimeout(() => {
+    console.log('Sending initialize message...');
     mcpServer.stdin.write(JSON.stringify(initializeMessage) + '\n');
   }, 1000);
 
-  // Handle client disconnect
-  req.on('close', () => {
-    console.log('Client disconnected, stopping MCP server');
-    mcpServer.kill();
-  });
-
-  req.on('error', (err) => {
-    console.error('SSE connection error:', err);
-    mcpServer.kill();
-  });
-
-  // Keep connection alive
-  const keepAlive = setInterval(() => {
-    if (!res.destroyed) {
-      res.write(': keepalive\n\n');
+  // Handle connection cleanup
+  const cleanup = () => {
+    console.log('Cleaning up MCP connection');
+    if (mcpServer && !mcpServer.killed) {
+      mcpServer.kill('SIGTERM');
     }
-  }, 30000);
+  };
+
+  req.on('close', cleanup);
+  req.on('error', (err) => {
+    console.error('SSE connection error:', err.message);
+    cleanup();
+  });
+
+  // Keep connection alive (reduced frequency to avoid spam)
+  const keepAlive = setInterval(() => {
+    if (!res.destroyed && res.writable) {
+      res.write(': keepalive\n\n');
+    } else {
+      clearInterval(keepAlive);
+    }
+  }, 45000);
 
   req.on('close', () => {
     clearInterval(keepAlive);
-  });
-});
-
-// Handle POST requests for MCP commands (StreamableHTTP support)
-app.post('/mcp', express.json(), (req, res) => {
-  console.log('MCP StreamableHTTP request:', req.body);
-  
-  // This would be for the newer StreamableHTTP transport
-  // For now, redirect to SSE
-  res.json({
-    error: 'Use SSE transport at /sse endpoint',
-    transport: 'sse',
-    endpoint: '/sse'
   });
 });
 
